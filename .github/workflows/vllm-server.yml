@@ -1,0 +1,483 @@
+# ============================================================
+#  vLLM Server — GitHub Actions hosted runner
+#  Auto-detects hardware (CPU on GitHub runners), launches
+#  vLLM with an OpenAI-compatible API, and exposes it via
+#  a Cloudflare Quick Tunnel (no account needed) or a
+#  named tunnel (CF_TUNNEL_TOKEN secret).
+#
+#  Hard limit: GitHub Actions kills jobs at 6 hours.
+#  This workflow shuts down cleanly at 5h 45m.
+#
+#  Required Secrets (Settings → Secrets → Actions):
+#    HF_TOKEN          — HuggingFace token (for gated models)
+#    CF_TUNNEL_TOKEN   — (optional) Cloudflare named tunnel token
+#    VLLM_API_KEY      — (optional) protect the endpoint
+#
+#  Trigger: manually via Actions tab → "Run workflow"
+# ============================================================
+
+name: 🚀 vLLM LLM Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: "HuggingFace model ID or local path"
+        required: false
+        default: "microsoft/Phi-3.5-mini-instruct"
+        type: string
+      max_model_len:
+        description: "Max context length (tokens)"
+        required: false
+        default: "4096"
+        type: string
+      session_hours:
+        description: "Session length in hours (max 5.75)"
+        required: false
+        default: "5.75"
+        type: string
+      tunnel_mode:
+        description: "Tunnel type"
+        required: false
+        default: "quick"
+        type: choice
+        options:
+          - quick      # Free, no account — trycloudflare.com URL
+          - named      # Requires CF_TUNNEL_TOKEN secret
+      extra_vllm_args:
+        description: "Extra vllm serve flags (space-separated)"
+        required: false
+        default: ""
+        type: string
+
+env:
+  MODEL_ID:       ${{ github.event.inputs.model_id      || 'microsoft/Phi-3.5-mini-instruct' }}
+  MAX_MODEL_LEN:  ${{ github.event.inputs.max_model_len || '4096' }}
+  SESSION_HOURS:  ${{ github.event.inputs.session_hours || '5.75' }}
+  TUNNEL_MODE:    ${{ github.event.inputs.tunnel_mode   || 'quick' }}
+  EXTRA_ARGS:     ${{ github.event.inputs.extra_vllm_args || '' }}
+  VLLM_PORT:      8000
+
+jobs:
+  serve:
+    name: "🤖 LLM Server (${{ github.event.inputs.model_id || 'Phi-3.5-mini' }})"
+    runs-on: ubuntu-latest
+    # Give the job its full 6h slot; we self-terminate at SESSION_HOURS
+    timeout-minutes: 360
+
+    steps:
+
+    # ── 0. Print session info ─────────────────────────────────────────────────
+    - name: 📋 Session Info
+      run: |
+        echo "=================================================="
+        echo "  vLLM Server Session"
+        echo "=================================================="
+        echo "  Model         : $MODEL_ID"
+        echo "  Max ctx len   : $MAX_MODEL_LEN tokens"
+        echo "  Session limit : ${SESSION_HOURS}h"
+        echo "  Tunnel mode   : $TUNNEL_MODE"
+        echo "  Runner OS     : $(uname -a)"
+        echo "  RAM           : $(free -h | awk '/^Mem:/{print $2}')"
+        echo "  CPU cores     : $(nproc)"
+        echo "  Disk free     : $(df -h / | awk 'NR==2{print $4}')"
+        echo "=================================================="
+        # Compute session timeout in seconds for the keep-alive loop
+        TIMEOUT_SECS=$(echo "$SESSION_HOURS * 3600" | bc | cut -d. -f1)
+        echo "TIMEOUT_SECS=$TIMEOUT_SECS" >> $GITHUB_ENV
+        echo "  Will auto-shutdown in ${TIMEOUT_SECS}s"
+
+    # ── 1. Checkout repo ──────────────────────────────────────────────────────
+    - name: 📥 Checkout
+      uses: actions/checkout@v4
+
+    # ── 2. Detect hardware ────────────────────────────────────────────────────
+    - name: 🔍 Detect Hardware
+      id: hw
+      run: |
+        echo "=== Hardware Detection ==="
+
+        BACKEND="cpu"
+        DTYPE="bfloat16"
+        DEVICE_FLAG="--device cpu"
+        ATTN_BACKEND=""
+
+        # NVIDIA GPU
+        if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+          GPU=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)
+          echo "[✓] NVIDIA GPU: $GPU"
+          BACKEND="cuda"
+          DTYPE="bfloat16"
+          DEVICE_FLAG=""
+          ATTN_BACKEND="VLLM_ATTENTION_BACKEND=FLASHINFER"
+        # AMD ROCm
+        elif command -v rocm-smi &>/dev/null 2>&1; then
+          echo "[✓] AMD ROCm GPU"
+          BACKEND="rocm"
+          DTYPE="bfloat16"
+          DEVICE_FLAG=""
+        # CPU fallback (standard on GitHub-hosted runners)
+        else
+          CORES=$(nproc)
+          INFERENCE_CORES=$((CORES - 2))
+          RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+          KV_CACHE_GB=$((RAM_GB / 3))
+          echo "[!] CPU backend — $CORES cores, ${RAM_GB}GB RAM"
+          echo "    Inference threads: $INFERENCE_CORES"
+          echo "    KV cache space: ${KV_CACHE_GB}GB"
+
+          # Env for CPU performance
+          echo "OMP_NUM_THREADS=$INFERENCE_CORES"             >> $GITHUB_ENV
+          echo "MKL_NUM_THREADS=$INFERENCE_CORES"             >> $GITHUB_ENV
+          echo "VLLM_CPU_OMP_THREADS_BIND=0-$((INFERENCE_CORES-1))" >> $GITHUB_ENV
+          echo "VLLM_CPU_KVCACHE_SPACE=$KV_CACHE_GB"         >> $GITHUB_ENV
+          echo "VLLM_CPU_NUM_OF_RESERVED_CPU=2"               >> $GITHUB_ENV
+        fi
+
+        echo "BACKEND=$BACKEND"         >> $GITHUB_ENV
+        echo "DTYPE=$DTYPE"             >> $GITHUB_ENV
+        echo "DEVICE_FLAG=$DEVICE_FLAG" >> $GITHUB_ENV
+        echo "backend=$BACKEND"         >> $GITHUB_OUTPUT
+        echo "dtype=$DTYPE"             >> $GITHUB_OUTPUT
+
+    # ── 3. Install system dependencies ───────────────────────────────────────
+    - name: 📦 Install System Dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          curl wget jq bc pv \
+          libnuma-dev \
+          libgomp1 \
+          2>/dev/null
+        echo "[✓] System dependencies installed"
+
+    # ── 4. Set up Python ──────────────────────────────────────────────────────
+    - name: 🐍 Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    # ── 5. Cache pip + HuggingFace model weights ──────────────────────────────
+    - name: 🗃️ Cache pip packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-vllm-${{ env.BACKEND }}-v0.29.0
+        restore-keys: |
+          ${{ runner.os }}-pip-vllm-${{ env.BACKEND }}-
+          ${{ runner.os }}-pip-vllm-
+
+    - name: 🗃️ Cache HuggingFace model weights
+      uses: actions/cache@v4
+      with:
+        # Cache keyed to the model ID so different models get separate caches
+        path: ~/.cache/huggingface
+        key: hf-model-${{ env.MODEL_ID }}-${{ env.MAX_MODEL_LEN }}
+        restore-keys: |
+          hf-model-${{ env.MODEL_ID }}-
+
+    # ── 6. Install vLLM ───────────────────────────────────────────────────────
+    - name: ⚙️ Install vLLM
+      run: |
+        pip install --upgrade pip uv -q
+
+        if [[ "$BACKEND" == "cuda" ]]; then
+          echo "[→] Installing vLLM (CUDA)..."
+          uv pip install vllm --system -q
+        elif [[ "$BACKEND" == "rocm" ]]; then
+          echo "[→] Installing vLLM (ROCm)..."
+          pip install vllm \
+            --extra-index-url https://wheels.vllm.ai/rocm/0.29.0/rocm723 \
+            -q
+        else
+          echo "[→] Installing vLLM (CPU)..."
+          pip install vllm-cpu -q || \
+          pip install "vllm[cpu]" \
+            --extra-index-url https://wheels.vllm.ai/0.29.0/cpu \
+            -q
+        fi
+
+        echo "[✓] vLLM version: $(python -c 'import vllm; print(vllm.__version__)')"
+
+    # ── 7. Install cloudflared ────────────────────────────────────────────────
+    - name: ☁️ Install cloudflared
+      run: |
+        LATEST=$(curl -s https://api.github.com/repos/cloudflare/cloudflared/releases/latest \
+          | jq -r .tag_name)
+        ARCH=$(uname -m)
+        [[ "$ARCH" == "aarch64" ]] && ARCH="arm64" || ARCH="amd64"
+        URL="https://github.com/cloudflare/cloudflared/releases/download/${LATEST}/cloudflared-linux-${ARCH}"
+        echo "[→] Downloading cloudflared ${LATEST} (${ARCH})..."
+        curl -fsSL "$URL" -o /usr/local/bin/cloudflared
+        chmod +x /usr/local/bin/cloudflared
+        echo "[✓] cloudflared: $(cloudflared --version)"
+
+    # ── 8. Start vLLM server (background) ────────────────────────────────────
+    - name: 🚀 Start vLLM Server
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+        VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
+      run: |
+        echo "[→] Launching vLLM (background)..."
+
+        # Build the command
+        VLLM_CMD="vllm serve $MODEL_ID \
+          --host 0.0.0.0 \
+          --port $VLLM_PORT \
+          --dtype $DTYPE \
+          --max-model-len $MAX_MODEL_LEN \
+          --trust-remote-code \
+          --enable-prefix-caching \
+          --uvicorn-log-level warning \
+          --served-model-name $(echo $MODEL_ID | sed 's|.*/||')"
+
+        # Backend-specific flags
+        if [[ "$BACKEND" == "cpu" ]]; then
+          VLLM_CMD="$VLLM_CMD --device cpu"
+        fi
+
+        # GPU-specific performance flags
+        if [[ "$BACKEND" == "cuda" || "$BACKEND" == "rocm" ]]; then
+          VLLM_CMD="$VLLM_CMD \
+            --enable-chunked-prefill \
+            --gpu-memory-utilization 0.90 \
+            --max-num-batched-tokens 16384"
+        fi
+
+        # API key flag
+        if [[ -n "${VLLM_API_KEY:-}" ]]; then
+          VLLM_CMD="$VLLM_CMD --api-key $VLLM_API_KEY"
+        fi
+
+        # Extra user-supplied args
+        if [[ -n "$EXTRA_ARGS" ]]; then
+          VLLM_CMD="$VLLM_CMD $EXTRA_ARGS"
+        fi
+
+        echo "[cmd] $VLLM_CMD"
+
+        # Launch in background, tee output to log
+        eval "$VLLM_CMD" > /tmp/vllm.log 2>&1 &
+        VLLM_PID=$!
+        echo "VLLM_PID=$VLLM_PID" >> $GITHUB_ENV
+        echo "[✓] vLLM PID: $VLLM_PID"
+
+    # ── 9. Wait for vLLM to be ready ──────────────────────────────────────────
+    - name: ⏳ Wait for vLLM to become healthy
+      run: |
+        echo "[→] Waiting for vLLM health endpoint..."
+        MAX_WAIT=300   # 5 minutes max for model load
+        INTERVAL=5
+        ELAPSED=0
+
+        while true; do
+          if curl -sf "http://localhost:$VLLM_PORT/health" &>/dev/null; then
+            echo "[✓] vLLM is healthy! (${ELAPSED}s)"
+            break
+          fi
+
+          # Check if process died
+          if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+            echo "[✗] vLLM process died! Last log output:"
+            tail -50 /tmp/vllm.log
+            exit 1
+          fi
+
+          if [[ $ELAPSED -ge $MAX_WAIT ]]; then
+            echo "[✗] Timeout waiting for vLLM after ${MAX_WAIT}s"
+            echo "--- vLLM log (last 50 lines) ---"
+            tail -50 /tmp/vllm.log
+            exit 1
+          fi
+
+          echo "  ... waiting ($ELAPSED/${MAX_WAIT}s)"
+          sleep $INTERVAL
+          ELAPSED=$((ELAPSED + INTERVAL))
+        done
+
+        # Print loaded models
+        echo ""
+        echo "=== Loaded Models ==="
+        curl -s "http://localhost:$VLLM_PORT/v1/models" | jq .
+
+    # ── 10. Start Cloudflare Tunnel ───────────────────────────────────────────
+    - name: 🌐 Start Cloudflare Tunnel
+      env:
+        CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      run: |
+        echo "[→] Starting Cloudflare Tunnel (mode: $TUNNEL_MODE)..."
+        TUNNEL_URL_FILE=/tmp/tunnel_url.txt
+
+        if [[ "$TUNNEL_MODE" == "named" && -n "${CF_TUNNEL_TOKEN:-}" ]]; then
+          # Named tunnel — uses your Cloudflare Zero Trust domain
+          echo "[→] Named tunnel with token..."
+          cloudflared tunnel --no-autoupdate run \
+            --token "$CF_TUNNEL_TOKEN" \
+            > /tmp/cloudflared.log 2>&1 &
+          CF_PID=$!
+          echo "CF_PID=$CF_PID" >> $GITHUB_ENV
+
+          sleep 5
+          echo "[✓] Named tunnel running (PID $CF_PID)"
+          echo "TUNNEL_URL=https://llm.yourdomain.com" > "$TUNNEL_URL_FILE"
+          echo "Public URL: Your configured Cloudflare hostname"
+
+        else
+          # Quick tunnel — free, no account needed
+          echo "[→] Quick tunnel (trycloudflare.com)..."
+          cloudflared tunnel --no-autoupdate --url "http://localhost:$VLLM_PORT" \
+            > /tmp/cloudflared.log 2>&1 &
+          CF_PID=$!
+          echo "CF_PID=$CF_PID" >> $GITHUB_ENV
+
+          # Extract the assigned URL (wait up to 30s)
+          for i in $(seq 1 30); do
+            TUNNEL_URL=$(grep -oP 'https://[a-z0-9\-]+\.trycloudflare\.com' \
+              /tmp/cloudflared.log 2>/dev/null | head -1 || true)
+            if [[ -n "$TUNNEL_URL" ]]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ -z "$TUNNEL_URL" ]]; then
+            echo "[!] Could not detect tunnel URL, check log:"
+            cat /tmp/cloudflared.log
+          fi
+
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+          echo "$TUNNEL_URL" > "$TUNNEL_URL_FILE"
+        fi
+
+        echo ""
+        echo "╔══════════════════════════════════════════════════╗"
+        echo "║           🌐  LLM SERVER IS LIVE!                ║"
+        echo "╠══════════════════════════════════════════════════╣"
+        echo "║  Public URL  : $(cat $TUNNEL_URL_FILE)          ║"
+        echo "║  Model       : $MODEL_ID                        ║"
+        echo "║  API base    : $(cat $TUNNEL_URL_FILE)/v1       ║"
+        echo "║  Health      : $(cat $TUNNEL_URL_FILE)/health   ║"
+        echo "║  Models list : $(cat $TUNNEL_URL_FILE)/v1/models║"
+        echo "╠══════════════════════════════════════════════════╣"
+        echo "║  Example curl:                                   ║"
+        echo "║  curl $(cat $TUNNEL_URL_FILE)/v1/chat/completions║"
+        echo "║    -H 'Content-Type: application/json'           ║"
+        echo "║    -d '{\"model\":\"...\",\"messages\":[{...}]}'  ║"
+        echo "╚══════════════════════════════════════════════════╝"
+
+    # ── 11. Keep-alive loop — holds the job until timeout ────────────────────
+    - name: 🔄 Keep-Alive Loop (auto-shutdown at timeout)
+      run: |
+        echo "[→] Keep-alive started. Session limit: ${SESSION_HOURS}h (${TIMEOUT_SECS}s)"
+        echo ""
+
+        START_TIME=$(date +%s)
+        HEARTBEAT_INTERVAL=300    # Print status every 5 min
+        LAST_HEARTBEAT=0
+        REQUEST_COUNT=0
+
+        while true; do
+          NOW=$(date +%s)
+          ELAPSED=$((NOW - START_TIME))
+          REMAINING=$((TIMEOUT_SECS - ELAPSED))
+
+          # ── Timeout reached — graceful shutdown ──────────────────────────
+          if [[ $REMAINING -le 0 ]]; then
+            echo ""
+            echo "⏰ Session timeout reached (${SESSION_HOURS}h). Shutting down gracefully..."
+            break
+          fi
+
+          # ── Heartbeat every 5 minutes ────────────────────────────────────
+          if [[ $((NOW - LAST_HEARTBEAT)) -ge $HEARTBEAT_INTERVAL ]]; then
+            ELAPSED_FMT=$(printf "%02d:%02d:%02d" \
+              $((ELAPSED/3600)) $(((ELAPSED%3600)/60)) $((ELAPSED%60)))
+            REMAINING_FMT=$(printf "%02d:%02d:%02d" \
+              $((REMAINING/3600)) $(((REMAINING%3600)/60)) $((REMAINING%60)))
+
+            # Health check
+            HEALTH="❌ DOWN"
+            if curl -sf "http://localhost:$VLLM_PORT/health" &>/dev/null; then
+              HEALTH="✅ UP"
+            fi
+
+            # Simple request counter from vllm log
+            REQUEST_COUNT=$(grep -c "POST /v1/" /tmp/vllm.log 2>/dev/null || echo "0")
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  ⏱  Elapsed   : $ELAPSED_FMT"
+            echo "  ⏳  Remaining : $REMAINING_FMT"
+            echo "  🤖  vLLM      : $HEALTH"
+            echo "  🌐  Tunnel    : $TUNNEL_URL"
+            echo "  📊  Requests  : ~$REQUEST_COUNT served"
+            echo "  💾  RAM used  : $(free -h | awk '/^Mem:/{print $3 " / " $2}')"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            # Re-print URL clearly so it's easy to find in logs
+            echo ""
+            echo "  📡 ENDPOINT → $TUNNEL_URL/v1"
+            echo ""
+
+            # Watchdog: restart vLLM if it crashed
+            if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+              echo "[!] vLLM process died — attempting restart..."
+              vllm serve "$MODEL_ID" \
+                --host 0.0.0.0 \
+                --port "$VLLM_PORT" \
+                --dtype "$DTYPE" \
+                --max-model-len "$MAX_MODEL_LEN" \
+                --trust-remote-code \
+                --enable-prefix-caching \
+                --uvicorn-log-level warning \
+                >> /tmp/vllm.log 2>&1 &
+              VLLM_PID=$!
+              echo "VLLM_PID=$VLLM_PID" >> $GITHUB_ENV
+              echo "[✓] Restarted vLLM PID: $VLLM_PID"
+            fi
+
+            LAST_HEARTBEAT=$NOW
+          fi
+
+          sleep 15
+        done
+
+        echo "[→] Graceful shutdown complete."
+
+    # ── 12. Shutdown & collect logs ───────────────────────────────────────────
+    - name: 🛑 Graceful Shutdown & Upload Logs
+      if: always()
+      run: |
+        echo "[→] Shutting down services..."
+
+        # Stop vLLM
+        if [[ -n "${VLLM_PID:-}" ]] && kill -0 "$VLLM_PID" 2>/dev/null; then
+          kill -SIGTERM "$VLLM_PID" 2>/dev/null
+          sleep 5
+          kill -SIGKILL "$VLLM_PID" 2>/dev/null || true
+          echo "[✓] vLLM stopped"
+        fi
+
+        # Stop cloudflared
+        if [[ -n "${CF_PID:-}" ]] && kill -0 "$CF_PID" 2>/dev/null; then
+          kill -SIGTERM "$CF_PID" 2>/dev/null || true
+          echo "[✓] cloudflared stopped"
+        fi
+
+        echo ""
+        echo "=== Final vLLM Log (last 30 lines) ==="
+        tail -30 /tmp/vllm.log 2>/dev/null || echo "(no log)"
+
+        echo ""
+        echo "=== Final Cloudflare Tunnel Log (last 20 lines) ==="
+        tail -20 /tmp/cloudflared.log 2>/dev/null || echo "(no log)"
+
+    - name: 📤 Upload Server Logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vllm-server-logs-${{ github.run_id }}
+        path: |
+          /tmp/vllm.log
+          /tmp/cloudflared.log
+        retention-days: 3
