@@ -1,0 +1,122 @@
+# docker-compose.yml
+# Supports NVIDIA, AMD, Intel XPU, and CPU automatically.
+# Run: docker compose --env-file .env up
+
+name: vllm-server
+
+x-common-env: &common-env
+  MODEL_ID: ${MODEL_ID:-microsoft/Phi-3.5-mini-instruct}
+  VLLM_PORT: ${VLLM_PORT:-8000}
+  MAX_MODEL_LEN: ${MAX_MODEL_LEN:-8192}
+  HF_TOKEN: ${HF_TOKEN:-}
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+
+services:
+
+  # ── NVIDIA GPU backend ──────────────────────────────────────────────────────
+  vllm-gpu:
+    image: vllm/vllm-openai:v0.29.0
+    profiles: [cuda]
+    restart: unless-stopped
+    shm_size: "8g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      <<: *common-env
+      VLLM_ATTENTION_BACKEND: FLASHINFER
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    command: >
+      ${MODEL_ID:-microsoft/Phi-3.5-mini-instruct}
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --gpu-memory-utilization 0.90
+      --max-num-batched-tokens 16384
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ── AMD ROCm backend ────────────────────────────────────────────────────────
+  vllm-rocm:
+    image: vllm/vllm-openai-rocm:v0.29.0
+    profiles: [rocm]
+    restart: unless-stopped
+    shm_size: "8g"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    environment:
+      <<: *common-env
+      HSA_OVERRIDE_GFX_VERSION: "11.0.0"
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    command: >
+      ${MODEL_ID:-microsoft/Phi-3.5-mini-instruct}
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.90
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ── CPU-only backend ────────────────────────────────────────────────────────
+  vllm-cpu:
+    image: vllm/vllm-openai-cpu:v0.29.0
+    profiles: [cpu]
+    restart: unless-stopped
+    shm_size: "4g"
+    environment:
+      <<: *common-env
+      OMP_NUM_THREADS: ${CPU_THREADS:-4}
+      VLLM_CPU_OMP_THREADS_BIND: ${CPU_BIND:-0-3}
+      VLLM_CPU_KVCACHE_SPACE: "8"
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    command: >
+      ${MODEL_ID:-microsoft/Phi-3.5-mini-instruct}
+      --host 0.0.0.0
+      --port 8000
+      --device cpu
+      --dtype bfloat16
+      --trust-remote-code
+
+  # ── Cloudflare Tunnel ───────────────────────────────────────────────────────
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    depends_on:
+      - vllm-gpu   # change to vllm-rocm or vllm-cpu per your profile
+    environment:
+      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
+    command: tunnel --no-autoupdate run
+    profiles: [cuda, rocm, cpu]  # runs with any profile
+
+volumes:
+  huggingface_cache:
