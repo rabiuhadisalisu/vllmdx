@@ -1,0 +1,21 @@
+# Cloudflare Tunnel config (dashboard-managed token approach)
+# Used when NOT using the token env var method.
+# Copy to ~/.cloudflared/config.yml
+
+tunnel: <YOUR_TUNNEL_ID>
+credentials-file: /root/.cloudflared/<YOUR_TUNNEL_ID>.json
+
+ingress:
+  # Route your domain to the vLLM API
+  - hostname: llm.yourdomain.com
+    service: http://localhost:8000
+    originRequest:
+      connectTimeout: 30s
+      noTLSVerify: false
+
+  # Health check endpoint
+  - hostname: llm-health.yourdomain.com
+    service: http://localhost:8000/health
+
+  # Catch-all (required)
+  - service: http_status:404
