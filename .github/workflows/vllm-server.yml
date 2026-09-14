@@ -49,16 +49,16 @@ env:
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '5.75' }}
   TUNNEL_MODE:   ${{ github.event.inputs.tunnel_mode   || 'quick' }}
   VLLM_PORT:     8000
-  # ── CRITICAL: must be set at workflow level so vllm config.__post_init__
-  #    sees it before CLI arg parsing even begins. Without this vLLM crashes
-  #    with "Failed to infer device type" on CPU-only runners.
+  # CRITICAL: must be set at workflow level so vllm config.__post_init__
+  # sees it before CLI arg parsing even begins. Without this vLLM crashes
+  # with "Failed to infer device type" on CPU-only runners.
   VLLM_TARGET_DEVICE: cpu
 
 jobs:
   serve:
     name: "🤖 LLM Server (${{ github.event.inputs.model_id || 'Qwen2.5-1.5B' }})"
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6h hard cap — we self-terminate at SESSION_HOURS
+    timeout-minutes: 360
 
     steps:
 
@@ -92,10 +92,10 @@ jobs:
         RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
         KV_CACHE_GB=$((RAM_GB > 3 ? RAM_GB / 3 : 1))
 
-        echo "TOTAL_CORES=$TOTAL_CORES"               >> $GITHUB_ENV
-        echo "INFERENCE_CORES=$INFERENCE_CORES"       >> $GITHUB_ENV
-        echo "KV_CACHE_GB=$KV_CACHE_GB"               >> $GITHUB_ENV
-        echo "BACKEND_ENGINE=vllm"                    >> $GITHUB_ENV
+        echo "TOTAL_CORES=$TOTAL_CORES"         >> $GITHUB_ENV
+        echo "INFERENCE_CORES=$INFERENCE_CORES" >> $GITHUB_ENV
+        echo "KV_CACHE_GB=$KV_CACHE_GB"         >> $GITHUB_ENV
+        echo "BACKEND_ENGINE=vllm"              >> $GITHUB_ENV
 
         echo "  Inference threads : $INFERENCE_CORES / $TOTAL_CORES"
         echo "  KV cache budget   : ${KV_CACHE_GB}GB"
@@ -132,9 +132,10 @@ jobs:
     # ── 5. System dependencies ────────────────────────────────────────────────
     - name: 📦 System Dependencies
       run: |
+        set -euo pipefail
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends \
-          curl wget jq bc numactl libnuma-dev libgomp1 2>/dev/null
+          curl wget jq bc numactl libnuma-dev libgomp1
         echo "[✓] System deps ready"
 
     # ── 6. Install vLLM for CPU ───────────────────────────────────────────────
@@ -142,15 +143,11 @@ jobs:
     #  Why this is hard:
     #  - vLLM publishes CPU wheels with a +cpu local version suffix on GitHub
     #    Releases. PEP 440 blocks local-version suffixes on PyPI, so pip's
-    #    resolver rejects every version of vllm-cpu when it tries to resolve
-    #    from the index — producing ResolutionImpossible.
-    #  - The community vllm-cpu PyPI package re-wraps the same wheel but pip
-    #    still conflicts when a CUDA torch is already present.
+    #    resolver rejects every version — producing ResolutionImpossible.
     #  - The fix: pre-pin torch to its CPU build FIRST so the resolver never
     #    sees a CUDA torch, then install vLLM by direct wheel URL.
-    #
-    #  IMPORTANT: never use  if cmd | tee file  — the pipe returns tee's exit
-    #  code (always 0), masking pip failures. Use  cmd && flag=true || true.
+    #  - Never use  if cmd | tee  — the pipe returns tee's exit code (always
+    #    0) masking failures. Use  cmd && flag=true || echo failed  instead.
     # ─────────────────────────────────────────────────────────────────────────
     - name: ⚙️ Install vLLM for CPU
       env:
@@ -163,12 +160,13 @@ jobs:
         echo ""
 
         INSTALLED=false
-        ARCH=$(uname -m)   # x86_64 or aarch64
+        ARCH=$(uname -m)
 
         # ── Pre-step: pin PyTorch to CPU build ────────────────────────────────
-        # This is the root cause of ResolutionImpossible — pip sees a CUDA
-        # torch already present and can't reconcile it with vllm-cpu's CPU
-        # torch requirement. Installing CPU torch first locks the resolver.
+        # Root cause of ResolutionImpossible is pip seeing a CUDA torch already
+        # present and being unable to reconcile it with vllm-cpu's CPU torch
+        # requirement. Installing CPU torch first locks the resolver before
+        # vllm is even attempted.
         echo "[pre] Pre-installing PyTorch CPU build to pin resolver..."
         pip install \
           torch torchvision torchaudio \
@@ -180,15 +178,15 @@ jobs:
         echo ""
 
         # ── Method 1: upstream official CPU wheel via direct GitHub URL ───────
-        # Most reliable. Bypasses PyPI entirely so PEP 440 +cpu suffix issue
-        # never comes up. Resolver is already happy because torch is pinned.
+        # Most reliable path. Bypasses PyPI entirely so the PEP 440 +cpu
+        # suffix rejection never occurs. Resolver is already satisfied because
+        # torch was pre-pinned above.
         echo "[1/3] Upstream vLLM CPU wheel (direct GitHub Releases URL)..."
 
-        LATEST_VER=$(curl -sf \
-          "https://api.github.com/repos/vllm-project/vllm/releases/latest" \
-          | python3 -c \
-            "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" \
+        LATEST_VER=$(curl -sf "https://api.github.com/repos/vllm-project/vllm/releases/latest" \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" \
           2>/dev/null || echo "0.29.0")
+
         echo "      Latest vLLM : v${LATEST_VER}"
         echo "      Arch        : ${ARCH}"
 
@@ -207,7 +205,7 @@ jobs:
         # the already-installed torch version to prevent version conflicts.
         if [[ "$INSTALLED" == "false" ]]; then
           echo ""
-          echo "[2/3] vllm-cpu (PyPI community package) with torch constraint..."
+          echo "[2/3] vllm-cpu (PyPI) with torch constraint..."
 
           TORCH_VER=$(python3 -c "import torch; print(torch.__version__)" 2>/dev/null || echo "")
 
@@ -234,8 +232,6 @@ jobs:
         #   GET  /v1/models
         #   POST /v1/chat/completions
         #   POST /v1/completions
-        # Note: requires a GGUF model. If MODEL_ID is not a GGUF repo,
-        # the launch step will attempt to find a bartowski GGUF variant.
         if [[ "$INSTALLED" == "false" ]]; then
           echo ""
           echo "[3/3] llama-cpp-python[server] (guaranteed fallback)..."
@@ -251,33 +247,31 @@ jobs:
         fi
 
         # ── Verify: actually import the installed module ───────────────────────
-        # Done in a heredoc so the VLLM_TARGET_DEVICE env var is visible
-        # to the Python process and we get a clean failure message.
         echo ""
         echo "=== Import Verification ==="
 
         if [[ "${BACKEND_ENGINE:-vllm}" == "vllm" ]]; then
           python3 - <<'PYEOF'
-import os, sys
-os.environ["VLLM_TARGET_DEVICE"] = "cpu"
-try:
-    import vllm
-    print(f"[✓] vLLM {vllm.__version__} imported successfully")
-except Exception as e:
-    print(f"[✗] vLLM import failed: {e}", file=sys.stderr)
-    sys.exit(1)
-PYEOF
-        else
-          python3 - <<'PYEOF'
-import sys
-try:
-    import llama_cpp
-    print(f"[✓] llama-cpp-python {llama_cpp.__version__} imported successfully")
-except Exception as e:
-    print(f"[✗] llama-cpp-python import failed: {e}", file=sys.stderr)
-    sys.exit(1)
-PYEOF
-        fi
+          import os, sys
+          os.environ["VLLM_TARGET_DEVICE"] = "cpu"
+          try:
+              import vllm
+              print(f"[✓] vLLM {vllm.__version__} imported successfully")
+          except Exception as e:
+              print(f"[✗] vLLM import failed: {e}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+                  else
+                    python3 - <<'PYEOF'
+          import sys
+          try:
+              import llama_cpp
+              print(f"[✓] llama-cpp-python {llama_cpp.__version__} imported successfully")
+          except Exception as e:
+              print(f"[✗] llama-cpp-python import failed: {e}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+                  fi
 
         echo ""
         echo "=== Installed package versions ==="
@@ -289,11 +283,17 @@ PYEOF
       run: |
         set -euo pipefail
 
-        LATEST=$(curl -sf \
-          "https://api.github.com/repos/cloudflare/cloudflared/releases/latest" \
+        # No trailing spaces after backslashes — that was the syntax error
+        LATEST=$(curl -sf "https://api.github.com/repos/cloudflare/cloudflared/releases/latest" \
           | jq -r .tag_name)
+
         ARCH=$(uname -m)
-        [[ "$ARCH" == "aarch64" ]] && CF_ARCH="arm64" || CF_ARCH="amd64"
+        if [[ "$ARCH" == "aarch64" ]]; then
+          CF_ARCH="arm64"
+        else
+          CF_ARCH="amd64"
+        fi
+
         URL="https://github.com/cloudflare/cloudflared/releases/download/${LATEST}/cloudflared-linux-${CF_ARCH}"
 
         echo "[→] Downloading cloudflared ${LATEST} (${CF_ARCH})..."
@@ -307,10 +307,7 @@ PYEOF
         HF_TOKEN:                     ${{ secrets.HF_TOKEN }}
         HUGGING_FACE_HUB_TOKEN:       ${{ secrets.HF_TOKEN }}
         VLLM_API_KEY:                 ${{ secrets.VLLM_API_KEY }}
-        # Device env var — read by vllm/config/device.py __post_init__
-        # BEFORE CLI argument parsing. Mandatory on CPU-only runners.
         VLLM_TARGET_DEVICE:           cpu
-        # CPU performance vars
         OMP_NUM_THREADS:              ${{ env.INFERENCE_CORES }}
         MKL_NUM_THREADS:              ${{ env.INFERENCE_CORES }}
         VLLM_CPU_KVCACHE_SPACE:       ${{ env.KV_CACHE_GB }}
@@ -322,14 +319,12 @@ PYEOF
           # ── llama-cpp-python server ──────────────────────────────────────
           echo "[→] Starting llama-cpp-python server..."
           echo "    Note: MODEL_ID should be a GGUF repo."
-          echo "    If not, attempting bartowski GGUF variant automatically."
 
-          # Auto-map non-GGUF HF model IDs to likely GGUF repos
+          # Auto-map non-GGUF HF model IDs to a bartowski GGUF variant
           if [[ "$MODEL_ID" != *"GGUF"* ]] && [[ "$MODEL_ID" != *".gguf"* ]]; then
             MODEL_NAME=$(echo "$MODEL_ID" | sed 's|.*/||')
-            GGUF_REPO="bartowski/${MODEL_NAME}-GGUF"
-            echo "[!] Remapping $MODEL_ID → $GGUF_REPO"
-            LAUNCH_MODEL="$GGUF_REPO"
+            LAUNCH_MODEL="bartowski/${MODEL_NAME}-GGUF"
+            echo "[!] Remapping $MODEL_ID → $LAUNCH_MODEL"
           else
             LAUNCH_MODEL="$MODEL_ID"
           fi
@@ -346,12 +341,18 @@ PYEOF
         else
           # ── vLLM server ──────────────────────────────────────────────────
           echo "[→] Starting vLLM CPU server..."
-          echo "    VLLM_TARGET_DEVICE        = cpu"
-          echo "    OMP_NUM_THREADS           = $INFERENCE_CORES"
-          echo "    VLLM_CPU_KVCACHE_SPACE    = ${KV_CACHE_GB}GB"
-          echo "    Model                     = $MODEL_ID"
-          echo "    Max context length        = $MAX_MODEL_LEN"
+          echo "    VLLM_TARGET_DEVICE     = cpu"
+          echo "    OMP_NUM_THREADS        = $INFERENCE_CORES"
+          echo "    VLLM_CPU_KVCACHE_SPACE = ${KV_CACHE_GB}GB"
+          echo "    Model                  = $MODEL_ID"
+          echo "    Max context length     = $MAX_MODEL_LEN"
           echo ""
+
+          # Build API key flag conditionally to avoid empty --api-key arg
+          API_KEY_FLAG=""
+          if [[ -n "${VLLM_API_KEY:-}" ]]; then
+            API_KEY_FLAG="--api-key ${VLLM_API_KEY}"
+          fi
 
           vllm serve "$MODEL_ID" \
             --device cpu \
@@ -363,29 +364,29 @@ PYEOF
             --enable-prefix-caching \
             --uvicorn-log-level warning \
             --served-model-name "$(echo "$MODEL_ID" | sed 's|.*/||')" \
-            $( [[ -n "${VLLM_API_KEY:-}" ]] && echo "--api-key $VLLM_API_KEY" ) \
+            $API_KEY_FLAG \
             > /tmp/vllm.log 2>&1 &
         fi
 
         VLLM_PID=$!
         echo "VLLM_PID=$VLLM_PID" >> $GITHUB_ENV
-        echo "[✓] Server PID: $VLLM_PID — waiting for health..."
+        echo "[✓] Server PID: $VLLM_PID"
 
     # ── 9. Wait for health ────────────────────────────────────────────────────
     - name: ⏳ Wait for Server Health
       run: |
         set -uo pipefail
 
-        echo "[→] Polling http://localhost:${VLLM_PORT}/health ..."
+        echo "[→] Polling http://localhost:${VLLM_PORT}/health"
         echo "    CPU model load can take 3–8 minutes — please wait."
         echo ""
 
-        MAX_WAIT=600   # 10 min — generous for slow CPU model load
+        MAX_WAIT=600
         INTERVAL=10
         ELAPSED=0
 
         while true; do
-          # Check process is alive BEFORE hitting the endpoint
+          # Check process alive BEFORE hitting the endpoint
           if ! kill -0 "$VLLM_PID" 2>/dev/null; then
             echo ""
             echo "[✗] Server process died. Full log:"
@@ -410,7 +411,6 @@ PYEOF
             exit 1
           fi
 
-          # Show last log line inline so progress is visible
           LAST_LINE=$(tail -1 /tmp/vllm.log 2>/dev/null \
             | sed 's/INFO [0-9-]* [0-9:]* //' \
             | cut -c1-80 || echo "")
@@ -436,7 +436,6 @@ PYEOF
         TUNNEL_URL=""
 
         if [[ "$TUNNEL_MODE" == "named" && -n "${CF_TUNNEL_TOKEN:-}" ]]; then
-          # Named tunnel — uses your Zero Trust domain (permanent URL)
           echo "[→] Starting named Cloudflare Tunnel..."
           cloudflared tunnel --no-autoupdate run \
             --token "$CF_TUNNEL_TOKEN" \
@@ -447,15 +446,13 @@ PYEOF
           echo "[✓] Named tunnel running (PID $CF_PID)"
 
         else
-          # Quick tunnel — free, no account needed
-          # URL format: https://xxxx-xxxx-xxxx.trycloudflare.com
           echo "[→] Starting Cloudflare Quick Tunnel..."
           cloudflared tunnel --no-autoupdate \
             --url "http://localhost:$VLLM_PORT" \
             > /tmp/cloudflared.log 2>&1 &
           CF_PID=$!
 
-          # Poll log for the assigned URL (up to 45s)
+          # Poll for URL — up to 45 seconds
           for i in $(seq 1 45); do
             TUNNEL_URL=$(grep -oP \
               'https://[a-z0-9\-]+\.trycloudflare\.com' \
@@ -465,16 +462,15 @@ PYEOF
           done
 
           if [[ -z "$TUNNEL_URL" ]]; then
-            echo "[!] Could not extract tunnel URL from log. cloudflared log:"
+            echo "[!] Could not extract tunnel URL. cloudflared log:"
             cat /tmp/cloudflared.log
             TUNNEL_URL="(check cloudflared log above)"
           fi
         fi
 
-        echo "CF_PID=$CF_PID"           >> $GITHUB_ENV
-        echo "TUNNEL_URL=$TUNNEL_URL"   >> $GITHUB_ENV
+        echo "CF_PID=$CF_PID"         >> $GITHUB_ENV
+        echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
 
-        # Print the endpoint prominently — this is what you need to copy
         echo ""
         echo "╔══════════════════════════════════════════════════════════╗"
         echo "║               🌐  LLM SERVER IS LIVE                    ║"
@@ -482,22 +478,16 @@ PYEOF
         printf "║  %-56s  ║\n" "Public URL  : $TUNNEL_URL"
         printf "║  %-56s  ║\n" "API base    : $TUNNEL_URL/v1"
         printf "║  %-56s  ║\n" "Health      : $TUNNEL_URL/health"
-        printf "║  %-56s  ║\n" "Model list  : $TUNNEL_URL/v1/models"
+        printf "║  %-56s  ║\n" "Models      : $TUNNEL_URL/v1/models"
         printf "║  %-56s  ║\n" "Engine      : ${BACKEND_ENGINE:-vllm}"
         printf "║  %-56s  ║\n" "Model       : $MODEL_ID"
         echo "╠══════════════════════════════════════════════════════════╣"
-        echo "║  Example:                                                ║"
         echo "║  curl $TUNNEL_URL/v1/chat/completions \\                 ║"
         echo "║    -H 'Content-Type: application/json' \\                ║"
         echo "║    -d '{\"model\":\"...\",\"messages\":[{...}]}'           ║"
         echo "╚══════════════════════════════════════════════════════════╝"
 
     # ── 11. Keep-alive loop ───────────────────────────────────────────────────
-    #
-    #  Holds the job alive until SESSION_HOURS expires.
-    #  Prints a heartbeat every 5 minutes with timing, health, and URL.
-    #  Watchdog auto-restarts vLLM if it crashes.
-    # ─────────────────────────────────────────────────────────────────────────
     - name: 🔄 Keep-Alive (auto-shutdown at timeout)
       env:
         VLLM_TARGET_DEVICE:           cpu
@@ -526,14 +516,14 @@ PYEOF
           ELAPSED=$((NOW - START))
           REMAINING=$((TIMEOUT_SECS - ELAPSED))
 
-          # ── Graceful shutdown when time is up ───────────────────────────
+          # Graceful shutdown when time is up
           if [[ $REMAINING -le 0 ]]; then
             echo ""
-            echo "⏰ Session limit reached (${SESSION_HOURS}h) — shutting down gracefully."
+            echo "⏰ Session limit reached (${SESSION_HOURS}h) — shutting down."
             break
           fi
 
-          # ── Heartbeat every 5 minutes ───────────────────────────────────
+          # Heartbeat every 5 minutes
           if [[ $((NOW - LAST_HB)) -ge 300 ]]; then
             E=$(printf "%02d:%02d:%02d" \
               $((ELAPSED/3600)) $(( (ELAPSED%3600)/60 )) $((ELAPSED%60)))
@@ -548,13 +538,13 @@ PYEOF
             REQUESTS=$(grep -c "POST /v1/" /tmp/vllm.log 2>/dev/null || echo "0")
 
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "  ⏱  Elapsed      : $E"
-            echo "  ⏳  Remaining    : $R"
-            echo "  🤖  Server       : $HEALTH_ICON"
-            echo "  🔁  Restarts     : $RESTART_COUNT"
-            echo "  📊  Requests     : ~$REQUESTS served"
-            echo "  💾  RAM          : $RAM_USED"
-            echo "  🌐  Endpoint     : $TUNNEL_URL/v1"
+            echo "  ⏱  Elapsed    : $E"
+            echo "  ⏳  Remaining  : $R"
+            echo "  🤖  Server     : $HEALTH_ICON"
+            echo "  🔁  Restarts   : $RESTART_COUNT"
+            echo "  📊  Requests   : ~$REQUESTS served"
+            echo "  💾  RAM        : $RAM_USED"
+            echo "  🌐  Endpoint   : $TUNNEL_URL/v1"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
             echo "  📡 COPY THIS → $TUNNEL_URL/v1"
@@ -563,10 +553,15 @@ PYEOF
             LAST_HB=$NOW
           fi
 
-          # ── Watchdog: auto-restart if vLLM process died ─────────────────
+          # Watchdog: auto-restart if server process died
           if ! kill -0 "$VLLM_PID" 2>/dev/null; then
             RESTART_COUNT=$((RESTART_COUNT + 1))
-            echo "[!] Server process gone (restart #${RESTART_COUNT}) — restarting..."
+            echo "[!] Server process gone — restart #${RESTART_COUNT}..."
+
+            API_KEY_FLAG=""
+            if [[ -n "${VLLM_API_KEY:-}" ]]; then
+              API_KEY_FLAG="--api-key ${VLLM_API_KEY}"
+            fi
 
             if [[ "${BACKEND_ENGINE:-vllm}" == "llamacpp" ]]; then
               python3 -m llama_cpp.server \
@@ -588,14 +583,13 @@ PYEOF
                 --enable-prefix-caching \
                 --uvicorn-log-level warning \
                 --served-model-name "$(echo "$MODEL_ID" | sed 's|.*/||')" \
+                $API_KEY_FLAG \
                 >> /tmp/vllm.log 2>&1 &
             fi
 
             VLLM_PID=$!
             echo "VLLM_PID=$VLLM_PID" >> $GITHUB_ENV
             echo "[✓] Restarted — new PID: $VLLM_PID"
-
-            # Brief wait for restart
             sleep 30
           fi
 
@@ -608,7 +602,6 @@ PYEOF
       run: |
         echo "[→] Stopping all services..."
 
-        # Stop vLLM / llama-cpp
         if [[ -n "${VLLM_PID:-}" ]]; then
           kill -SIGTERM "$VLLM_PID" 2>/dev/null || true
           sleep 5
@@ -616,7 +609,6 @@ PYEOF
           echo "[✓] Server stopped"
         fi
 
-        # Stop cloudflared
         if [[ -n "${CF_PID:-}" ]]; then
           kill -SIGTERM "$CF_PID" 2>/dev/null || true
           echo "[✓] Cloudflare tunnel stopped"
@@ -634,7 +626,7 @@ PYEOF
         tail -20 /tmp/cloudflared.log 2>/dev/null || echo "(no log)"
         echo "────────────────────────────────────────────"
 
-    # ── 13. Upload logs as artifact ───────────────────────────────────────────
+    # ── 13. Upload logs ───────────────────────────────────────────────────────
     - name: 📤 Upload Logs
       if: always()
       uses: actions/upload-artifact@v4
